@@ -126,7 +126,7 @@ containing both the system CAs and your private CA.
 ## HA Config Directory
 
 Mylo stores its memory, notes, scratchpad, conversation history, and audit
-log under a `.mylo/` subdirectory inside the HA config directory. It checks
+log under a `.mylo-siliconflow/` subdirectory inside the HA config directory. It checks
 for the config dir in this order:
 
 1. `MYLO_CONFIG_DIR` env var (if set)
@@ -136,7 +136,7 @@ for the config dir in this order:
 
 Mount your HA config volume at `/config` or `/homeassistant` — whichever path
 you prefer. The container does not need write access to the HA config files
-themselves, only to the `.mylo/` subdirectory it creates within them.
+themselves, only to the `.mylo-siliconflow/` subdirectory it creates within them.
 
 ---
 
@@ -145,7 +145,7 @@ themselves, only to the `.mylo/` subdirectory it creates within them.
 ```yaml
 services:
   mylo:
-    image: ghcr.io/oasis-enterprise/amd64-addon-mylo:1.0.6
+    image: ghcr.io/letsgodancing/amd64-addon-mylo-siliconflow:1.9.0.1
     restart: unless-stopped
     ports:
       - "8099:8099"
@@ -280,7 +280,7 @@ spec:
 
       containers:
         - name: mylo
-          image: ghcr.io/oasis-enterprise/amd64-addon-mylo:1.0.6
+          image: ghcr.io/letsgodancing/amd64-addon-mylo-siliconflow:1.9.0.1
           env:
             - name: SUPERVISOR_TOKEN
               valueFrom:
@@ -374,7 +374,7 @@ history from the UI or via the `/api/conversation/clear` endpoint, then start
 a new conversation.
 
 **HA config directory must be writable.**
-Mylo creates `.mylo/` under the HA config dir at startup for its database,
+Mylo creates `.mylo-siliconflow/` under the HA config dir at startup for its database,
 memory files, and audit log. If the volume is read-only or the container UID
 lacks write permission, startup will fail silently or Mylo will run without
 persistence.

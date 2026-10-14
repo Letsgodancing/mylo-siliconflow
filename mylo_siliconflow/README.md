@@ -4,7 +4,7 @@ A persistent, memory-aware AI agent that lives inside your Home Assistant as a s
 
 Mylo connects deeply to your HA instance over websocket — it knows your entities, devices, areas, automations, dashboards, integrations, and learned preferences. It can read, create, and modify your HA configuration, control devices, detect anomalies, and proactively surface issues. It remembers across sessions.
 
-> **Status:** v1.4.0. Tested daily against a 2200-entity production HA instance. Pre-built images for amd64 and aarch64.
+> Fork version: **1.9.0.1**, based on [upstream Mylo v1.9.0](https://github.com/Oasis-Enterprise/mylo/releases/tag/v1.9.0). See this repository’s Actions and Releases for validated build and image status. Upstream production testing does not establish fork compatibility.
 
 ## SiliconFlow support
 
@@ -18,7 +18,7 @@ SiliconFlow pricing is not built into the upstream cost table; displayed USD cos
 
 1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories**
 2. Add: `https://github.com/Letsgodancing/mylo-siliconflow`
-3. Install **Mylo**, set your API key in the Configuration tab
+3. Install **Mylo SiliconFlow**, set your API key in the Configuration tab
 4. Start — it appears as a sidebar panel
 
 Pre-built images available for **amd64** (x86 mini PCs, NUCs, Proxmox) and **aarch64** (Raspberry Pi 4/5). If no pre-built image exists for your architecture, the add-on builds from source on install.
@@ -400,8 +400,8 @@ The footer shows `budget: Nk/200k tokens · cost: $X.XX this session` in real ti
 Requires Python 3.12+, Node 20+.
 
 ```bash
-git clone https://github.com/Oasis-Enterprise/mylo.git
-cd mylo
+git clone https://github.com/Letsgodancing/mylo-siliconflow.git
+cd mylo-siliconflow/mylo_siliconflow
 
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
