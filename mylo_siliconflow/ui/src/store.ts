@@ -1,0 +1,109 @@
+// Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Session-level state for the header status bar and input footer.
+// Chat items, SSE plumbing, and approval state still live in App.tsx
+// — only the cross-cutting counters (turns, cumulative tokens, cost,
+// last-turn-usage) live here so Header and Composer don't need prop-
+// drilling.
+
+import { create } from "zustand";
+import { estimateCost, type UsageDelta } from "./lib/cost";
+import type { ToolLabelTable } from "./lib/labels";
+
+interface SessionState {
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cachedWriteTokens: number;
+  costUsd: number;
+  lastTurnTokens: number;
+  lastContextTokens: number;
+  // Model + provider whose rates drive the cost calc. Synced from
+  // `/api/status` on each poll (Header's onStatus) so the footer
+  // prices against whatever the server is actually configured to run.
+  model: string;
+  provider: string;
+  // Plain-language tool label + tier lookup, synced from `/api/status`
+  // (handleStatus). Empty until the first poll lands (or forever, on a
+  // server that doesn't send it) — toolLabel() humanizes the raw name
+  // in that case.
+  toolLabels: ToolLabelTable;
+
+  recordTurn(usage: UsageDelta): void;
+  reset(): void;
+  setModel(model: string, provider?: string): void;
+  setToolLabels(table: ToolLabelTable): void;
+}
+
+export const useSession = create<SessionState>((set, get) => ({
+  turns: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cachedReadTokens: 0,
+  cachedWriteTokens: 0,
+  costUsd: 0,
+  lastTurnTokens: 0,
+  lastContextTokens: 0,
+  model: "claude-sonnet-4-6",
+  provider: "anthropic",
+  toolLabels: {},
+
+  recordTurn(usage) {
+    const delta = estimateCost(usage, get().model, get().provider);
+    const inTokens = usage.input_tokens ?? 0;
+    const outTokens = usage.output_tokens ?? 0;
+    const cacheRead = usage.cache_read_input_tokens ?? 0;
+    const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+    set((s) => ({
+      turns: s.turns + 1,
+      inputTokens: s.inputTokens + inTokens,
+      outputTokens: s.outputTokens + outTokens,
+      cachedReadTokens: s.cachedReadTokens + cacheRead,
+      cachedWriteTokens: s.cachedWriteTokens + cacheWrite,
+      costUsd: s.costUsd + delta,
+      lastTurnTokens: inTokens + outTokens,
+      // The "context used" counter in the header tracks how close
+      // we are to the model's window. Input tokens on the last turn
+      // is the best proxy — includes system prompt + history.
+      lastContextTokens: inTokens + cacheRead,
+    }));
+  },
+
+  reset() {
+    set({
+      turns: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      costUsd: 0,
+      lastTurnTokens: 0,
+      lastContextTokens: 0,
+    });
+  },
+
+  setModel(model, provider) {
+    set(provider ? { model, provider } : { model });
+  },
+
+  setToolLabels(table) {
+    // Called on every status poll with a freshly-parsed object; skip the
+    // set (and the re-render it would trigger in every subscriber) when
+    // the table is unchanged.
+    if (JSON.stringify(table) === JSON.stringify(get().toolLabels)) return;
+    set({ toolLabels: table });
+  },
+}));

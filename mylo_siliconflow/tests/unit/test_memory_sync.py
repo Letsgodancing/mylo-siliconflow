@@ -1,0 +1,1085 @@
+# Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for M8b: pruner, reconciler, and /api/memory/sync endpoint.
+
+The reconciler is LLM-driven in production; here we stub the provider
+so the test asserts the orchestration (YAML parse → protect → prune
+plan) without a real API call.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from aiohttp import web
+
+from mylo.memory.pruner import apply_prune, plan_prune
+from mylo.memory.reconciler import _RECONCILER_MAX_TOKENS, StateDiff, _build_user_payload, run_sync
+from mylo.memory.schema import (
+    Baselines,
+    Claim,
+    Conflict,
+    EntityBaseline,
+    FindingCooldown,
+    HouseholdMember,
+    ItemMetadata,
+    KnownIssue,
+    Note,
+    NotificationSuppression,
+    PendingAction,
+    RejectedSuggestion,
+    Suggestion,
+    empty_memory,
+)
+from mylo.memory.store import MemoryStore
+from mylo.server.routes_memory import register_memory_routes
+
+NOW = datetime(2026, 4, 13, 10, 0, tzinfo=UTC)
+
+
+def iso(days_ago: int) -> str:
+    return (NOW - timedelta(days=days_ago)).isoformat()
+
+
+# ─── Pruner ─────────────────────────────────────────────────────────────────
+
+
+def test_pruner_drops_expired_ttl() -> None:
+    mem = empty_memory()
+    mem.notes.append(
+        Note(
+            id="n_expired",
+            content="ephemeral",
+            metadata=ItemMetadata(
+                created=iso(30),
+                ttl=iso(1),  # TTL was yesterday
+            ),
+        )
+    )
+    mem.notes.append(
+        Note(
+            id="n_live",
+            content="still relevant",
+            metadata=ItemMetadata(
+                created=iso(30),
+                ttl=(NOW + timedelta(days=30)).isoformat(),
+            ),
+        )
+    )
+    report = plan_prune(mem, now=NOW)
+    reasons = {c.item_id: c.reason for c in report.candidates}
+    assert reasons.get("n_expired") == "ttl_expired"
+    assert "n_live" not in reasons
+
+
+def test_pruner_flags_stale_unconfirmed_observations() -> None:
+    mem = empty_memory()
+    mem.notes.append(
+        Note(
+            id="n_stale",
+            content="seen once, never confirmed",
+            source="observation",
+            metadata=ItemMetadata(created=iso(120), source="observation"),
+        )
+    )
+    mem.notes.append(
+        Note(
+            id="n_fresh",
+            content="seen yesterday",
+            source="observation",
+            metadata=ItemMetadata(created=iso(10), source="observation"),
+        )
+    )
+    report = plan_prune(mem, now=NOW)
+    reasons = {c.item_id: c.reason for c in report.candidates}
+    assert reasons.get("n_stale") == "stale_observation"
+    assert "n_fresh" not in reasons
+
+
+def test_pruner_never_drops_user_confirmed_or_critical() -> None:
+    mem = empty_memory()
+    mem.notes.append(
+        Note(
+            id="n_user",
+            content="user confirmed this",
+            source="user_confirmed",
+            metadata=ItemMetadata(
+                created=iso(400),
+                source="user_confirmed",
+                ttl=iso(30),  # would normally expire
+            ),
+        )
+    )
+    mem.notes.append(
+        Note(
+            id="n_crit",
+            content="critical note",
+            source="conversation",
+            metadata=ItemMetadata(
+                created=iso(400),
+                priority="critical",
+                ttl=iso(30),  # would normally expire
+            ),
+        )
+    )
+    report = plan_prune(mem, now=NOW)
+    ids = {c.item_id for c in report.candidates}
+    assert "n_user" not in ids
+    assert "n_crit" not in ids
+
+
+def test_pruner_archives_resolved_issues() -> None:
+    mem = empty_memory()
+    mem.known_issues.append(KnownIssue(id="i_resolved", description="fixed", status="resolved"))
+    mem.known_issues.append(KnownIssue(id="i_active", description="still broken", status="active"))
+    report = plan_prune(mem, now=NOW)
+    reasons = {c.item_id: c.reason for c in report.candidates}
+    assert reasons.get("i_resolved") == "resolved_issue"
+    assert "i_active" not in reasons
+
+
+def test_pruner_drops_old_rejections() -> None:
+    mem = empty_memory()
+    mem.rejected.append(RejectedSuggestion(id="r_old", suggestion="no thanks", date=iso(200)))
+    mem.rejected.append(RejectedSuggestion(id="r_new", suggestion="still relevant", date=iso(30)))
+    report = plan_prune(mem, now=NOW)
+    ids = {c.item_id for c in report.candidates}
+    assert "r_old" in ids
+    assert "r_new" not in ids
+
+
+def test_pruner_has_no_pattern_rules() -> None:
+    """Patterns were removed from the data model; the pruner must not
+    reference them (no attribute access, no candidate section)."""
+    mem = empty_memory()
+    mem.notes.append(Note(id="n_1", content="just a note"))
+    mem.rejected.append(RejectedSuggestion(id="r_old", suggestion="no thanks", date=iso(200)))
+    report = plan_prune(mem, now=NOW)
+    assert all(c.section != "patterns" for c in report.candidates)
+    pruned = apply_prune(mem, report)
+    assert "patterns" not in pruned.model_dump()
+
+
+def test_pruner_low_reference_respects_budget() -> None:
+    mem = empty_memory()
+    for i in range(10):
+        mem.notes.append(
+            Note(
+                id=f"n_{i}",
+                content=f"note {i}",
+                metadata=ItemMetadata(
+                    created=iso(60 + i),
+                    reference_count=i,  # 0..9
+                ),
+            )
+        )
+    report = plan_prune(mem, now=NOW, target_budget=3)
+    low_ref = [c for c in report.candidates if c.reason == "low_reference"]
+    assert len(low_ref) == 3
+    # Lowest ref_count should be flagged first.
+    assert low_ref[0].item_id == "n_0"
+
+
+def test_apply_prune_removes_flagged_items() -> None:
+    mem = empty_memory()
+    mem.notes.append(
+        Note(
+            id="n_drop",
+            content="bye",
+            metadata=ItemMetadata(created=iso(30), ttl=iso(1)),
+        )
+    )
+    mem.notes.append(Note(id="n_keep", content="stays"))
+    report = plan_prune(mem, now=NOW)
+    pruned = apply_prune(mem, report)
+    ids = {n.id for n in pruned.notes}
+    assert ids == {"n_keep"}
+
+
+# ─── Reconciler (with stubbed provider) ─────────────────────────────────────
+
+
+@dataclass
+class _FakeResponse:
+    text: str
+    content_blocks: list = field(default_factory=list)
+    tool_calls: list = field(default_factory=list)
+    stop_reason: str = "end_turn"
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+class _FakeProvider:
+    def __init__(self, reply: str, *, stop_reason: str = "end_turn") -> None:
+        self.reply = reply
+        self.stop_reason = stop_reason
+        self.calls: list[dict[str, Any]] = []
+
+    async def message(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return _FakeResponse(text=self.reply, stop_reason=self.stop_reason)
+
+
+async def test_reconciler_noop_without_scratchpad_or_diff(tmp_path: Path) -> None:
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    provider = _FakeProvider(reply="version: 2\n")  # should not be called
+
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="claude-haiku-4-5-20251001",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is None
+    assert "no new scratchpad" in result.summary
+    assert provider.calls == []
+
+
+async def test_reconciler_parses_yaml_and_preserves_user_sections(tmp_path: Path) -> None:
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+
+    # Seed memory with household + user-confirmed note.
+    mem = empty_memory()
+    mem.household.members.append(HouseholdMember(name="Maxwell", role="primary_user"))
+    mem.notes.append(
+        Note(
+            id="n_user",
+            content="garage light off after 8pm",
+            source="user_confirmed",
+            metadata=ItemMetadata(created=iso(30), source="user_confirmed"),
+        )
+    )
+    await store.save(mem, note="seed")
+
+    # Scratchpad entry so reconciler actually runs.
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "likes warm light", recorded: "2026-04-12", '
+        'confidence: 0.9, conversation_id: "c1"}\n'
+    )
+
+    # Haiku-style reply — drops household AND user-confirmed note on purpose.
+    # The reconciler should re-add them via _protect_user_sections.
+    model_reply = (
+        "version: 2\n"
+        "last_sync: '2026-04-13T10:00:00+00:00'\n"
+        "household:\n"
+        "  members: []\n"
+        "  shared: {}\n"
+        "notes:\n"
+        "  - id: n_new\n"
+        "    content: likes warm light\n"
+        "    metadata:\n"
+        "      created: '2026-04-13T10:00:00+00:00'\n"
+        "      source: conversation\n"
+        "      reference_count: 1\n"
+        "known_issues: []\n"
+        "rejected: []\n"
+        "conflicts: []\n"
+        "monitored_entities: []\n"
+    )
+    provider = _FakeProvider(reply=model_reply)
+
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is not None
+    # Household restored from original.
+    assert [m.name for m in result.updated.household.members] == ["Maxwell"]
+    # User-confirmed note re-added.
+    ids = {n.id for n in result.updated.notes}
+    assert "n_user" in ids
+    assert "n_new" in ids
+
+
+async def test_reconciler_detects_truncated_output(tmp_path: Path) -> None:
+    """A max_tokens stop means the YAML is cut mid-document. Don't parse
+    it — report truncation and leave memory untouched."""
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "likes warm light", recorded: "2026-04-12", '
+        'confidence: 0.9, conversation_id: "c1"}\n'
+    )
+    # Half a document: valid up to the cut, then nothing.
+    provider = _FakeProvider(
+        reply="version: 2\nnotes:\n  - id: n1\n    content: 'cut off he",
+        stop_reason="max_tokens",
+    )
+
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="claude-haiku-4-5-20251001",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is None
+    assert "truncated" in result.summary
+    assert "malformed" not in result.summary
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["max_tokens"] == _RECONCILER_MAX_TOKENS
+
+
+def test_reconciler_cap_is_below_sdk_nonstreaming_ceiling() -> None:
+    """The Anthropic SDK raises before sending a non-streaming request whose
+    max_tokens implies >10 min of generation (max_tokens > ~21,333). The
+    reconciler call is non-streaming, so the cap must stay under that.
+    Uses a private SDK helper on purpose: it IS the guard we must not trip."""
+    from anthropic import AsyncAnthropic
+
+    client = AsyncAnthropic(api_key="test-key")
+    client._calculate_nonstreaming_timeout(_RECONCILER_MAX_TOKENS, None)  # must not raise
+
+
+async def test_reconciler_handles_malformed_yaml(tmp_path: Path) -> None:
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "anything", recorded: "2026-04-12", '
+        'confidence: 1.0, conversation_id: "c1"}\n'
+    )
+    provider = _FakeProvider(reply=":::not valid yaml::: [[[")
+
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is None
+    assert "malformed" in result.summary
+
+
+async def test_reconciler_emits_conflict_on_contradiction(tmp_path: Path) -> None:
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "observation", scope: {entity: "cover.garage_door"}, '
+        'content: "garage door fails 4x/month", recorded: "2026-04-12", '
+        'confidence: 0.9, conversation_id: "c1"}\n'
+    )
+
+    # Reply adds a conflict where the scratchpad contradicts existing memory.
+    model_reply = (
+        "version: 2\n"
+        "last_sync: '2026-04-13T10:00:00+00:00'\n"
+        "household:\n"
+        "  members: []\n"
+        "  shared: {}\n"
+        "notes: []\n"
+        "known_issues: []\n"
+        "rejected: []\n"
+        "monitored_entities: []\n"
+        "conflicts:\n"
+        "  - id: conflict_abc123\n"
+        "    type: contradiction\n"
+        "    subject: {entity: 'cover.garage_door'}\n"
+        "    claim_a:\n"
+        "      content: 'garage door works fine'\n"
+        "      source: memory\n"
+        "      date: '2026-03-01'\n"
+        "    claim_b:\n"
+        "      content: 'garage door fails 4x/month'\n"
+        "      source: scratchpad\n"
+        "      date: '2026-04-12'\n"
+        "    status: pending_review\n"
+    )
+    provider = _FakeProvider(reply=model_reply)
+
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is not None
+    assert result.conflicts_added == 1
+    assert len(result.updated.pending_conflicts()) == 1
+
+
+async def test_reconciler_fallback_without_provider(tmp_path: Path) -> None:
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "offline-merged note", recorded: "2026-04-12", '
+        'confidence: 1.0, conversation_id: "c1"}\n'
+    )
+
+    result = await run_sync(
+        store=store,
+        provider=None,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is not None
+    contents = [n.content for n in result.updated.notes]
+    assert "offline-merged note" in contents
+
+
+# ─── Endpoint smoke ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def memory_app(tmp_path: Path) -> web.Application:
+    from mylo.server.app import AppKeys
+    from tests.unit._helpers import make_config
+
+    app = web.Application()
+    config = make_config(tmp_path)
+    config.mylo_data_dir.mkdir(parents=True, exist_ok=True)
+    store = MemoryStore(mylo_data_dir=config.mylo_data_dir)
+
+    app[AppKeys.CONFIG] = config
+    app[AppKeys.MEMORY] = store
+    register_memory_routes(app)
+    return app
+
+
+async def test_get_memory_endpoint(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    await store.load()
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/memory")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["version"] == 2
+    assert body["counts"]["notes"] == 0
+
+
+async def test_sync_endpoint_without_provider_is_graceful(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    # No AppKeys.PROVIDER set → endpoint should still return 200.
+    config = memory_app[AppKeys.CONFIG]
+    (config.mylo_data_dir / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "endpoint test note", recorded: "2026-04-12", '
+        'confidence: 1.0, conversation_id: "c1"}\n'
+    )
+    store = memory_app[AppKeys.MEMORY]
+    await store.load()
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/sync", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["changed"] is True  # fallback merge landed the scratchpad note
+
+
+async def test_sync_endpoint_apply_prune_flag(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.notes.append(
+        Note(
+            id="n_expired",
+            content="stale",
+            metadata=ItemMetadata(created=iso(30), ttl=iso(1)),
+        )
+    )
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/sync", json={"apply_prune": True})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["applied"] is True
+    assert any(c["id"] == "n_expired" for c in body["prune_candidates"])
+
+    # Reload and confirm the stale note is gone on disk.
+    reloaded = await MemoryStore(mylo_data_dir=store.mylo_data_dir).load()
+    assert all(n.id != "n_expired" for n in reloaded.notes)
+
+
+# ─── M8c: full view, delete, prune-only, conflict resolve ───────────────────
+
+
+async def test_get_memory_full_returns_whole_document(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.notes.append(Note(id="n1", content="keep me"))
+    mem.household.members.append(HouseholdMember(name="Alice", role="primary_user"))
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/memory/full")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["version"] == 2
+    assert [n["id"] for n in body["notes"]] == ["n1"]
+    assert [m["name"] for m in body["household"]["members"]] == ["Alice"]
+
+
+async def test_delete_memory_item_removes_note(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.notes.append(Note(id="n_drop", content="bye"))
+    mem.notes.append(Note(id="n_keep", content="stays"))
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.delete("/api/memory/item", json={"section": "notes", "id": "n_drop"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+
+    reloaded = await MemoryStore(mylo_data_dir=store.mylo_data_dir).load()
+    assert {n.id for n in reloaded.notes} == {"n_keep"}
+
+
+async def test_delete_memory_item_rejects_unknown_section(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    await memory_app[AppKeys.MEMORY].load()
+    client = await aiohttp_client(memory_app)
+    resp = await client.delete("/api/memory/item", json={"section": "household", "id": "anyone"})
+    assert resp.status == 400
+
+
+async def test_delete_memory_item_404_when_id_missing(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    await memory_app[AppKeys.MEMORY].load()
+    client = await aiohttp_client(memory_app)
+    resp = await client.delete(
+        "/api/memory/item", json={"section": "notes", "id": "does_not_exist"}
+    )
+    assert resp.status == 404
+
+
+async def test_prune_only_endpoint_drops_expired(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.notes.append(
+        Note(
+            id="n_expired",
+            content="stale",
+            metadata=ItemMetadata(created=iso(30), ttl=iso(1)),
+        )
+    )
+    mem.notes.append(Note(id="n_keep", content="stays"))
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/prune", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["applied"] == 1
+
+    reloaded = await MemoryStore(mylo_data_dir=store.mylo_data_dir).load()
+    assert {n.id for n in reloaded.notes} == {"n_keep"}
+
+
+async def test_prune_only_honors_ids_filter(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.notes.append(
+        Note(
+            id="n_a",
+            content="stale a",
+            metadata=ItemMetadata(created=iso(30), ttl=iso(1)),
+        )
+    )
+    mem.notes.append(
+        Note(
+            id="n_b",
+            content="stale b",
+            metadata=ItemMetadata(created=iso(30), ttl=iso(1)),
+        )
+    )
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/prune", json={"ids": ["n_a"]})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["applied"] == 1
+
+    reloaded = await MemoryStore(mylo_data_dir=store.mylo_data_dir).load()
+    assert {n.id for n in reloaded.notes} == {"n_b"}
+
+
+async def test_resolve_conflict_marks_status_resolved(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.conflicts.append(
+        Conflict(
+            id="conflict_abc",
+            type="contradiction",
+            subject={"entity": "cover.garage_door"},
+            claim_a=Claim(content="works fine", source="memory"),
+            claim_b=Claim(content="fails 4x/month", source="scratchpad"),
+            status="pending_review",
+        )
+    )
+    await store.save(mem, note="seed")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/conflict/conflict_abc/resolve", json={"choice": "b"})
+    assert resp.status == 200
+
+    reloaded = await MemoryStore(mylo_data_dir=store.mylo_data_dir).load()
+    assert reloaded.conflicts[0].status == "resolved"
+    assert reloaded.conflicts[0].resolution is not None
+    assert reloaded.conflicts[0].resolution["choice"] == "b"
+    assert reloaded.pending_conflicts() == []
+
+
+async def test_resolve_conflict_404_for_unknown_id(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    await memory_app[AppKeys.MEMORY].load()
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/conflict/nope/resolve", json={"choice": "a"})
+    assert resp.status == 404
+
+
+async def test_get_scratchpad_endpoint_returns_pending_entries(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    config = memory_app[AppKeys.CONFIG]
+    (config.mylo_data_dir / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "sprinklers offline is fine", recorded: "2026-04-15", '
+        'confidence: 1.0, conversation_id: "c1"}\n'
+    )
+    await memory_app[AppKeys.MEMORY].load()
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/memory/scratchpad")
+    assert resp.status == 200
+    body = await resp.json()
+    assert len(body["entries"]) == 1
+    assert body["entries"][0]["content"] == "sprinklers offline is fine"
+
+
+async def test_sync_endpoint_drains_scratchpad_on_save(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    config = memory_app[AppKeys.CONFIG]
+    scratch = config.mylo_data_dir / "scratchpad.yaml"
+    scratch.write_text(
+        '- {type: "user_note", scope: {general: true}, '
+        'content: "drained after sync", recorded: "2026-04-15", '
+        'confidence: 1.0, conversation_id: "c1"}\n'
+    )
+    await memory_app[AppKeys.MEMORY].load()
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.post("/api/memory/sync", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["scratchpad_drained"] == 1
+    assert not scratch.exists()
+    # Archived to history.
+    archived = list((config.mylo_data_dir / "history").glob("scratchpad_*.yaml"))
+    assert len(archived) == 1
+
+
+async def test_get_scratchpad_endpoint_empty_when_missing(
+    aiohttp_client, memory_app: web.Application
+) -> None:
+    from mylo.server.app import AppKeys
+
+    await memory_app[AppKeys.MEMORY].load()
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/memory/scratchpad")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["entries"] == []
+
+
+# ─── Reconciler prompt bloat (large-instance guards) ─────────────────────────
+
+
+def test_user_payload_excludes_machine_sections_and_bounds_diff() -> None:
+    """The reconciler prompt must not carry machine-owned state, and the
+    state diff must be sampled, or large instances blow the context window."""
+    mem = empty_memory()
+    mem.notes.append(
+        Note(id="n1", content="SEMANTIC_NOTE_MARKER", metadata=ItemMetadata(created=iso(1)))
+    )
+    mem.monitored_entities = [f"sensor.monitored_{i}" for i in range(300)]
+    mem.baselines = Baselines(
+        entities=[
+            EntityBaseline(entity=f"sensor.bl_{i}", metric="mean", avg=1.0, stddev=0.1)
+            for i in range(300)
+        ]
+    )
+    mem.pending_actions.append(
+        PendingAction(
+            id="duration_anomaly_light.x",
+            type="duration_anomaly",
+            entity_id="light.x",
+            title="t",
+            message="PENDING_MARKER",
+            detected_at=iso(0),
+            last_seen=iso(0),
+        )
+    )
+    mem.suggestions.append(
+        Suggestion(id="s1", type="while_away", entity_id="light.y", description="SUGGESTION_MARKER")
+    )
+    mem.finding_cooldowns.append(
+        FindingCooldown(type="while_away", entity_id="light.z", until=iso(-7))
+    )
+    mem.notification_suppressions.append(
+        NotificationSuppression(type="anomaly", entity="SUPPRESS_MARKER")
+    )
+
+    diff = StateDiff(new_entities=[f"sensor.new_{i}" for i in range(2000)])
+    payload = _build_user_payload(mem, [], diff)
+
+    # Semantic data the LLM actually reconciles is present.
+    assert "SEMANTIC_NOTE_MARKER" in payload
+    # Machine-owned sections are absent.
+    assert "sensor.monitored_0" not in payload
+    assert "sensor.bl_0" not in payload
+    assert "PENDING_MARKER" not in payload
+    assert "SUGGESTION_MARKER" not in payload
+    assert "SUPPRESS_MARKER" not in payload
+    # Diff is sampled, not dumped whole.
+    assert "sensor.new_0" in payload
+    assert "sensor.new_1999" not in payload
+    assert "more" in payload.lower()
+    # Payload is small even though the memory was large.
+    assert len(payload) < 50_000
+
+
+async def test_machine_sections_carried_over_untouched(tmp_path: Path) -> None:
+    """Machine state must survive a reconcile verbatim — the LLM can neither
+    drop it (it's never sent) nor overwrite it (we ignore its version)."""
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+
+    mem = empty_memory()
+    mem.monitored_entities = ["sensor.keep_me"]
+    mem.baselines = Baselines(
+        entities=[EntityBaseline(entity="sensor.keep_me", metric="mean", avg=5.0, stddev=1.0)]
+    )
+    mem.pending_actions.append(
+        PendingAction(
+            id="duration_anomaly_light.a",
+            type="duration_anomaly",
+            entity_id="light.a",
+            title="t",
+            message="m",
+            detected_at=iso(0),
+            last_seen=iso(0),
+        )
+    )
+    mem.suggestions.append(
+        Suggestion(
+            id="sg1", type="while_away", entity_id="light.b", description="d", times_accepted=2
+        )
+    )
+    mem.finding_cooldowns.append(
+        FindingCooldown(type="while_away", entity_id="light.c", until=iso(-7))
+    )
+    mem.notification_suppressions.append(NotificationSuppression(type="anomaly", entity="sensor.q"))
+    await store.save(mem, note="seed")
+
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, content: "x", '
+        'recorded: "2026-04-12", confidence: 0.9, conversation_id: "c1"}\n'
+    )
+
+    # Reply omits some machine sections and tries to overwrite others with junk.
+    model_reply = (
+        "version: 2\n"
+        "notes:\n"
+        "  - id: n_new\n"
+        "    content: x\n"
+        "    metadata:\n"
+        "      created: '2026-04-13T10:00:00+00:00'\n"
+        "      source: conversation\n"
+        "      reference_count: 1\n"
+        "monitored_entities: ['sensor.LLM_INJECTED']\n"
+        "pending_actions: []\n"
+        "baselines: {entities: [], energy: null}\n"
+        "suggestions: []\n"
+    )
+    provider = _FakeProvider(reply=model_reply)
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert result.updated is not None
+    m = result.updated
+    assert m.monitored_entities == ["sensor.keep_me"]
+    assert [b.entity for b in m.baselines.entities] == ["sensor.keep_me"]
+    assert [p.id for p in m.pending_actions] == ["duration_anomaly_light.a"]
+    assert [s.id for s in m.suggestions] == ["sg1"]
+    assert [c.entity_id for c in m.finding_cooldowns] == ["light.c"]
+    assert [n.entity for n in m.notification_suppressions] == ["sensor.q"]
+    # The model never even saw the machine state.
+    sent = provider.calls[0]["messages"][0]["content"]
+    assert "sensor.keep_me" not in sent
+
+
+async def test_oversized_semantic_memory_compacts_and_reconciles(tmp_path: Path) -> None:
+    """A memory too big for the window is compacted to fit so the LLM merge
+    still runs (instead of being skipped), and the notes dropped from the
+    payload are re-attached afterward rather than lost."""
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+
+    mem = empty_memory()
+    big = "x" * 500
+    for i in range(2000):
+        mem.notes.append(Note(id=f"n{i}", content=big, metadata=ItemMetadata(created=iso(1))))
+    await store.save(mem, note="seed")
+
+    (tmp_path / "scratchpad.yaml").write_text(
+        '- {type: "user_note", scope: {general: true}, content: "x", '
+        'recorded: "2026-04-12", confidence: 0.9, conversation_id: "c1"}\n'
+    )
+    provider = _FakeProvider(reply="version: 2\n")
+    result = await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="haiku",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    # The LLM was called (no longer skipped) and a merge was produced.
+    assert provider.calls != []
+    assert result.updated is not None
+    assert "too large" not in result.summary
+    # The notes compacted out of the payload were re-attached, not lost.
+    assert len(result.updated.notes) > 500
+
+
+# ─── Scratchpad bounds ──────────────────────────────────────────────────────
+#
+# When nightly merges fail in a streak, nothing drains the scratchpad —
+# it used to grow without bound (and the whole file was sent to the LLM
+# every night). run_sync now trims the file to a hard cap (overflow is
+# archived to history/, never silently deleted) and reads at most
+# _SCRATCHPAD_RECONCILE_LIMIT entries into the payload.
+
+
+def _scratch_line(i: int) -> str:
+    return (
+        f'- {{type: "user_note", scope: {{general: true}}, '
+        f'content: "scratch note {i}", recorded: "2026-08-01", '
+        f'confidence: 1.0, conversation_id: "c1"}}'
+    )
+
+
+def test_trim_scratchpad_noop_under_bound(tmp_path: Path) -> None:
+    from mylo.memory.scratchpad import trim_scratchpad
+
+    path = tmp_path / "scratchpad.yaml"
+    path.write_text("\n".join(_scratch_line(i) for i in range(5)) + "\n")
+
+    removed = trim_scratchpad(tmp_path, max_entries=10, keep=5)
+
+    assert removed == 0
+    assert len(path.read_text().strip().splitlines()) == 5
+    assert not (tmp_path / "history").exists()
+
+
+def test_trim_scratchpad_archives_overflow_keeps_newest(tmp_path: Path) -> None:
+    from mylo.memory.scratchpad import read_scratchpad, trim_scratchpad
+
+    path = tmp_path / "scratchpad.yaml"
+    path.write_text("\n".join(_scratch_line(i) for i in range(20)) + "\n")
+
+    removed = trim_scratchpad(tmp_path, max_entries=10, keep=5)
+
+    assert removed == 15
+    kept = read_scratchpad(tmp_path)
+    assert len(kept) == 5
+    # Entries append chronologically; the newest (highest i) survive.
+    assert kept[0].content == "scratch note 19"
+    archives = list((tmp_path / "history").glob("scratchpad_overflow_*.yaml"))
+    assert len(archives) == 1
+    assert len(archives[0].read_text().strip().splitlines()) == 20
+
+
+def test_trim_scratchpad_missing_file_is_noop(tmp_path: Path) -> None:
+    from mylo.memory.scratchpad import trim_scratchpad
+
+    assert trim_scratchpad(tmp_path, max_entries=10, keep=5) == 0
+
+
+async def test_run_sync_bounds_scratchpad_payload(tmp_path: Path, monkeypatch: Any) -> None:
+    from mylo.memory import reconciler as reconciler_mod
+
+    monkeypatch.setattr(reconciler_mod, "_SCRATCHPAD_RECONCILE_LIMIT", 3)
+
+    store = MemoryStore(mylo_data_dir=tmp_path)
+    await store.load()
+    (tmp_path / "scratchpad.yaml").write_text("\n".join(_scratch_line(i) for i in range(6)) + "\n")
+    provider = _FakeProvider(reply="version: 2\n")
+
+    await run_sync(
+        store=store,
+        provider=provider,
+        registries=None,
+        model="claude-haiku-4-5-20251001",
+        mylo_data_dir=tmp_path,
+        now=NOW,
+    )
+
+    assert provider.calls, "reconciler should have called the provider"
+    payload = str(provider.calls[0]["messages"])
+    assert "scratch note 5" in payload  # newest included
+    assert "scratch note 0" not in payload  # oldest excluded by limit
+
+
+# ─── /api/findings ──────────────────────────────────────────────────────────
+#
+# The catch-up banner only renders after a 2h absence; this endpoint is
+# the always-available surface behind the panel's findings badge.
+
+
+async def test_get_findings_endpoint(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    store = memory_app[AppKeys.MEMORY]
+    mem = await store.load()
+    mem.pending_actions.append(
+        PendingAction(
+            id="f1",
+            type="unavailable",
+            entity_id="light.porch",
+            title="Entity unavailable",
+            message="light.porch went unavailable",
+            detected_at="2026-08-11T10:00:00+00:00",
+            last_seen="2026-08-11T12:00:00+00:00",
+            confidence=0.7,
+        )
+    )
+    mem.pending_actions.append(
+        PendingAction(
+            id="f2",
+            type="anomaly",
+            entity_id="sensor.temp",
+            title="Anomaly",
+            message="way off baseline",
+            detected_at="2026-08-11T11:00:00+00:00",
+            last_seen="2026-08-11T11:00:00+00:00",
+            confidence=0.95,
+        )
+    )
+    mem.pending_actions.append(
+        PendingAction(
+            id="f3",
+            type="anomaly",
+            entity_id="sensor.old",
+            title="Resolved",
+            message="done",
+            detected_at="2026-08-10T10:00:00+00:00",
+            last_seen="2026-08-10T10:00:00+00:00",
+            confidence=1.0,
+            resolved=True,
+        )
+    )
+    await store.save(mem, note="seed findings")
+
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/findings")
+    assert resp.status == 200
+    body = await resp.json()
+
+    assert body["count"] == 2  # resolved finding excluded
+    assert [f["id"] for f in body["findings"]] == ["f2", "f1"]  # confidence desc
+    first = body["findings"][0]
+    assert first["title"] == "Anomaly"
+    assert first["entity_id"] == "sensor.temp"
+    assert first["last_seen"] == "2026-08-11T11:00:00+00:00"
+
+
+async def test_get_findings_empty(aiohttp_client, memory_app: web.Application) -> None:
+    from mylo.server.app import AppKeys
+
+    await memory_app[AppKeys.MEMORY].load()
+    client = await aiohttp_client(memory_app)
+    resp = await client.get("/api/findings")
+    body = await resp.json()
+    assert body == {"findings": [], "count": 0}

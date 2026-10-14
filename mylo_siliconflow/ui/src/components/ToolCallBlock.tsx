@@ -1,0 +1,144 @@
+// Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { useState } from "react";
+import { formatDuration } from "../lib/format";
+import { toolLabel } from "../lib/labels";
+import { useSession } from "../store";
+import type { ToolCallRecord } from "../types";
+import { StatusDot, type DotTone } from "./StatusDot";
+
+interface Props {
+  call: ToolCallRecord;
+}
+
+// Collapsed row: dot · name (accent bold mono) · summary (dim mono).
+// Right side: duration · rotating chevron. Click to reveal params
+// block in mono 10px. Matches the "rename_entities dry run" treatment
+// in the Signal screenshot.
+export function ToolCallBlock({ call }: Props) {
+  const [open, setOpen] = useState(false);
+  const table = useSession((s) => s.toolLabels);
+  const label = toolLabel(call.name, table);
+
+  const isAwaitingApproval =
+    call.state === "error" && call.errorCode === "confirmation_required";
+
+  const tone: DotTone = call.state === "pending"
+    ? "warning"
+    : isAwaitingApproval
+      ? "warning"
+      : call.state === "ok"
+        ? "accent"
+        : "error";
+
+  const summary = buildSummary(call, isAwaitingApproval);
+  const durationLabel = call.durationMs !== undefined
+    ? formatDuration(call.durationMs)
+    : call.state === "pending"
+      ? "…"
+      : "";
+
+  return (
+    <div
+      className="my-1 rounded border bg-surface-raised"
+      style={{ borderColor: "var(--color-border)" }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left"
+      >
+        <StatusDot tone={tone} pulse={call.state === "pending"} />
+        <span
+          className="font-mono font-bold text-[11px]"
+          style={{ color: tone === "error" ? "var(--color-error)" : "var(--color-accent)" }}
+        >
+          {label}
+        </span>
+        {summary ? (
+          <span
+            className="font-mono text-[10px]"
+            style={{ color: "var(--color-text-dim)" }}
+          >
+            {summary}
+          </span>
+        ) : null}
+        <span className="ml-auto flex items-center gap-2">
+          {durationLabel ? (
+            <span
+              className="font-mono text-[10px]"
+              style={{ color: "var(--color-text-muted)" }}
+            >
+              {durationLabel}
+            </span>
+          ) : null}
+          <Chevron open={open} />
+        </span>
+      </button>
+      {open ? (
+        <div
+          className="border-t"
+          style={{ borderColor: "var(--color-border)", backgroundColor: "var(--color-surface)" }}
+        >
+          <div
+            className="px-3 pt-2 font-mono text-[10px]"
+            style={{ color: "var(--color-text-dim)" }}
+          >
+            {call.name}
+          </div>
+          <pre
+            className="overflow-auto px-3 py-2 font-mono text-[10px] leading-[1.55]"
+            style={{ color: "var(--color-text-muted)" }}
+          >
+            {JSON.stringify(call.input, null, 2)}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function buildSummary(call: ToolCallRecord, awaiting: boolean): string {
+  if (awaiting) return "awaiting approval";
+  if (call.errorCode && call.state === "error") return call.errorCode;
+  if (call.summary) return call.summary;
+  if (call.state === "pending") return "running";
+  return "";
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="8"
+      height="8"
+      viewBox="0 0 10 10"
+      fill="none"
+      style={{
+        transform: open ? "rotate(180deg)" : "none",
+        transition: "transform 120ms ease",
+        color: "var(--color-text-muted)",
+      }}
+    >
+      <path
+        d="M2 3.5L5 6.5L8 3.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}

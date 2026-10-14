@@ -1,0 +1,119 @@
+# Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""LLM provider abstraction.
+
+The tool loop (:mod:`mylo.llm.tool_loop`) talks to this interface, not to
+any specific SDK. The Anthropic implementation is in
+:mod:`mylo.llm.anthropic_provider`; future OpenAI / Ollama providers
+slot in behind the same Protocol.
+
+Message shape matches Anthropic's native format (role + content blocks)
+because it's the most expressive — text, tool_use, and tool_result blocks
+in a single list. The OpenAI adapter (when it lands) will translate.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, TypedDict
+
+Role = Literal["user", "assistant"]
+
+
+class ProviderMessage(TypedDict):
+    """A message in the provider-facing conversation.
+
+    ``content`` is either a plain string (user turns pre-tool-use) or a
+    list of content blocks (assistant turns with tool_use, user turns with
+    tool_result).
+    """
+
+    role: Role
+    content: str | list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class ToolCall:
+    """A single tool invocation the model requested."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ProviderResponse:
+    """One model turn, shaped provider-agnostic."""
+
+    # Raw content blocks for replay into the next turn (Anthropic format).
+    content_blocks: list[dict[str, Any]]
+    # Convenience: concatenated text blocks for display.
+    text: str
+    # Tool calls the model made this turn.
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    # Typically "end_turn" or "tool_use".
+    stop_reason: str = ""
+    # Token usage, if the provider reported it.
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDelta:
+    """A chunk of assistant text produced while a model call is still
+    running. Only text streams; tool calls arrive with the final
+    :class:`ProviderResponse`."""
+
+    text: str
+
+
+class Provider(Protocol):
+    """Minimal LLM provider interface.
+
+    One method: take a system prompt + conversation + tool schema, return
+    one turn. The tool loop handles the "call-tools-and-loop" dance on
+    top of this.
+    """
+
+    async def message(
+        self,
+        *,
+        system: str,
+        messages: list[ProviderMessage],
+        tools: list[dict[str, Any]],
+        model: str,
+        max_tokens: int = 8192,
+    ) -> ProviderResponse: ...
+
+
+class StreamingProvider(Protocol):
+    """Optional extension: a provider that can stream text deltas.
+
+    ``stream`` yields zero or more :class:`StreamDelta` and then exactly
+    one :class:`ProviderResponse` shaped identically to what ``message``
+    returns, so callers persist the result through one code path. The
+    tool loop probes for this method with ``getattr`` and falls back to
+    ``message`` when absent.
+    """
+
+    def stream(
+        self,
+        *,
+        system: str,
+        messages: list[ProviderMessage],
+        tools: list[dict[str, Any]],
+        model: str,
+        max_tokens: int = 8192,
+    ) -> AsyncIterator[StreamDelta | ProviderResponse]: ...

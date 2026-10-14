@@ -1,0 +1,72 @@
+configuration:
+  api_key:
+    name: LLM API Key
+    description: >-
+      API key for your chosen provider (SiliconFlow, Anthropic, OpenAI, or Gemini). BYOK —
+      Mylo uses your key directly, nothing is proxied through Oasis Enterprise
+      servers. Leave blank when using Ollama (local).
+  llm_provider:
+    name: LLM Provider
+    description: >-
+      Which model provider to use: `anthropic`, `openai`, `gemini`, `siliconflow`, or `ollama`
+      (run a local model for free). Set the matching key/URL fields below.
+  model:
+    name: Conversation Model
+    description: Model used for conversations. Choose a model supporting function calling.
+  reconciliation_model:
+    name: Reconciliation Model
+    description: >-
+      Model used for nightly memory reconciliation. Use a model from your selected provider —
+      faster and cheaper since this is structured YAML merging.
+  session_budget_usd:
+    name: Session Budget (USD)
+    description: >-
+      Soft per-conversation budget. Mylo warns — it does not block — when a
+      session's estimated cost passes 80%. Estimates only; ignored for local
+      Ollama models.
+  monthly_budget_usd:
+    name: Monthly Budget (USD)
+    description: >-
+      Soft monthly budget. Mylo warns — it does not block — when this month's
+      estimated spend passes 80%. Resets each calendar month. Estimates only;
+      ignored for local Ollama models.
+  context_budget_factor:
+    name: Context Budget Factor
+    description: >-
+      Fraction of the model's context window Mylo may spend on the prompt.
+      Lower = cheaper/faster, higher = more context per turn. Default 0.6.
+  context_output_reserve_tokens:
+    name: Output Reserve (tokens)
+    description: Tokens held back from the budget for the model's reply.
+  working_set_max_entities:
+    name: Working Set Size
+    description: >-
+      Max entities pre-loaded into the prompt per turn. Anything else is
+      still reachable by query. 0 disables pre-loading.
+  sync_frequency:
+    name: Memory Sync Frequency
+    description: How often Mylo reconciles conversation notes into its memory file.
+  memory_token_limit:
+    name: Memory Token Limit
+    description: Soft cap on the context file size. Mylo prompts to prune above 80%.
+  proactive_notifications:
+    name: Background Monitoring
+    description: >-
+      Enable the hourly background sweep (unavailable entities, anomalies,
+      learned checks). Findings appear in the Mylo panel — no notifications
+      are sent.
+  max_daily_notifications:
+    name: Max Daily Notifications (deprecated)
+    description: Deprecated — ignored. Notifications were removed; findings live in the Mylo panel.
+  quiet_hours_start:
+    name: Quiet Hours Start (deprecated)
+    description: Deprecated — ignored. Notifications were removed; findings live in the Mylo panel.
+  quiet_hours_end:
+    name: Quiet Hours End (deprecated)
+    description: Deprecated — ignored. Notifications were removed; findings live in the Mylo panel.
+  log_level:
+    name: Log Level
+    description: Python log level for the Mylo process.
+  siliconflow_url:
+    name: SiliconFlow API URL
+    description: OpenAI-compatible base URL, default https://api.siliconflow.cn/v1.

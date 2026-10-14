@@ -1,0 +1,209 @@
+# Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""``query_dashboard`` — retrieve Lovelace dashboard configurations.
+
+HA exposes two kinds of dashboards:
+
+* **Storage mode** — edited in the HA UI, fetched via ``lovelace/config``
+  with a ``url_path`` argument. The default dashboard uses ``url_path=null``.
+* **YAML mode** — configured in ``configuration.yaml`` (or a package); fetched
+  via file read. For M2 we only surface the storage-mode path; YAML-mode
+  dashboards will flow through ``read_config_file`` once that tool lands.
+
+The ``lovelace/dashboards/list`` command enumerates all non-default dashboards.
+Combined with the default (``url_path=None``), that's the full list.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from mylo.dashboard.ops import section_heading
+from mylo.dashboard.plan import card_fingerprint, is_heading_card
+from mylo.ha.ws_client import CommandError
+from mylo.tools.base import Tier, ToolDefinition, ToolResult
+from mylo.tools.context import ToolContext
+from mylo.tools.registry import register
+
+
+class QueryDashboardParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dashboard_id: str | None = Field(
+        default=None,
+        description=(
+            "Dashboard url_path (e.g. 'lovelace', 'overview'). Omit to list "
+            "all dashboards without fetching their configs."
+        ),
+    )
+    view_id: str | None = Field(
+        default=None,
+        description=(
+            "If set along with ``dashboard_id``, return only the single view "
+            "with this ``path`` from the dashboard config."
+        ),
+    )
+
+
+async def _list_dashboards(ctx: ToolContext) -> list[dict[str, Any]]:
+    try:
+        raw = await ctx.ws_client.send_command("lovelace/dashboards/list")
+    except CommandError:
+        raw = []
+    items: list[dict[str, Any]] = [
+        {
+            "dashboard_id": d.get("url_path"),
+            "title": d.get("title"),
+            "mode": d.get("mode"),
+            "icon": d.get("icon"),
+            "require_admin": d.get("require_admin", False),
+            "show_in_sidebar": d.get("show_in_sidebar", True),
+        }
+        for d in (raw or [])
+        if isinstance(d, dict)
+    ]
+    # Always include the default dashboard.
+    items.insert(
+        0,
+        {
+            "dashboard_id": None,
+            "title": "Overview",
+            "mode": "storage",
+            "icon": "mdi:view-dashboard",
+            "default": True,
+        },
+    )
+    return items
+
+
+async def _fetch_config(ctx: ToolContext, dashboard_id: str | None) -> Any:
+    # ``url_path`` accepts null for the default dashboard.
+    return await ctx.ws_client.send_command("lovelace/config", url_path=dashboard_id)
+
+
+def _card_summary(index: int, card: Any) -> dict[str, Any]:
+    fp = card_fingerprint(card)
+    out: dict[str, Any] = {"index": index, "type": fp.type}
+    if fp.entity:
+        out["entity"] = fp.entity
+    if is_heading_card(card):
+        out["heading"] = card.get("heading")
+    return out
+
+
+def _section_summary(index: int, section: Any, *, include_cards: bool) -> dict[str, Any]:
+    section_cards = section.get("cards") or [] if isinstance(section, dict) else []
+    out: dict[str, Any] = {"index": index, "heading": section_heading(section)}
+    if include_cards:
+        out["cards"] = [_card_summary(j, c) for j, c in enumerate(section_cards)]
+    else:
+        out["card_count"] = len(section_cards)
+    return out
+
+
+def _view_summary(view: dict[str, Any], *, include_cards: bool) -> dict[str, Any]:
+    cards = view.get("cards") or []
+    sections = view.get("sections")
+    summary: dict[str, Any] = {
+        "path": view.get("path"),
+        "title": view.get("title"),
+        "icon": view.get("icon"),
+        "card_count": len(cards) if isinstance(cards, list) else 0,
+    }
+    # Sections views carry per-section headings so a whole-dashboard
+    # listing can be addressed without pulling every card; with
+    # include_cards, per-card {index, type, entity} lets plan_dashboard
+    # ops address a section by heading and a card by index without a
+    # second query.
+    if view.get("type") == "sections" or isinstance(sections, list):
+        summary["layout"] = "sections"
+        if isinstance(sections, list):
+            summary["section_count"] = len(sections)
+            summary["sections"] = [
+                _section_summary(i, s, include_cards=include_cards) for i, s in enumerate(sections)
+            ]
+    elif isinstance(cards, list) and include_cards:
+        summary["cards"] = [_card_summary(j, c) for j, c in enumerate(cards)]
+    return summary
+
+
+async def handler(params: QueryDashboardParams, ctx: ToolContext) -> ToolResult:
+    if params.dashboard_id is None and params.view_id is None:
+        dashboards = await _list_dashboards(ctx)
+        return ToolResult.ok({"dashboards": dashboards, "count": len(dashboards)})
+
+    try:
+        config = await _fetch_config(ctx, params.dashboard_id)
+    except CommandError as exc:
+        if exc.code in ("config_not_found", "not_found"):
+            return ToolResult.error(
+                "dashboard_not_found",
+                f"no dashboard with url_path {params.dashboard_id!r}",
+            )
+        return ToolResult.error("ha_error", f"{exc.code}: {exc.message}")
+
+    if not isinstance(config, dict):
+        return ToolResult.error(
+            "unexpected_response",
+            f"lovelace/config returned {type(config).__name__}",
+        )
+
+    views = config.get("views") or []
+    if params.view_id:
+        for v in views:
+            if isinstance(v, dict) and v.get("path") == params.view_id:
+                s = _view_summary(v, include_cards=True)
+                indexed = {
+                    k: s[k]
+                    for k in ("layout", "sections", "cards", "section_count", "card_count")
+                    if k in s
+                }
+                return ToolResult.ok(
+                    {
+                        "dashboard_id": params.dashboard_id,
+                        "view": v,
+                        **indexed,
+                    }
+                )
+        return ToolResult.error(
+            "view_not_found",
+            f"view {params.view_id!r} not in dashboard {params.dashboard_id!r}",
+            data={"available": [v.get("path") for v in views if isinstance(v, dict)]},
+        )
+
+    return ToolResult.ok(
+        {
+            "dashboard_id": params.dashboard_id,
+            "title": config.get("title"),
+            "view_count": len(views),
+            "views": [_view_summary(v, include_cards=False) for v in views if isinstance(v, dict)],
+        }
+    )
+
+
+TOOL = ToolDefinition(
+    name="query_dashboard",
+    description=(
+        "Read Lovelace dashboards. No params: list dashboards. dashboard_id: "
+        "per-view summaries (section headings, card counts). dashboard_id + "
+        "view_id: the full view with indexed sections/cards for addressing "
+        "plan operations. Storage-mode dashboards only."
+    ),
+    params_model=QueryDashboardParams,
+    tier=Tier.READ,
+    handler=handler,
+)
+register(TOOL)

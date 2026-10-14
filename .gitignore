@@ -1,0 +1,9 @@
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.DS_Store
+
+# Local task tooling and deliverables
+/work/
+/outputs/

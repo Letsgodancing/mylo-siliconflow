@@ -1,0 +1,64 @@
+# Home Assistant add-on manifest.
+# Docs: https://developers.home-assistant.io/docs/add-ons/configuration
+name: Mylo SiliconFlow
+version: "1.9.0.1"
+slug: mylo_siliconflow
+description: AI agent that lives inside Home Assistant — deep context, memory, and safe config editing.
+url: https://github.com/Letsgodancing/mylo-siliconflow
+image: ghcr.io/letsgodancing/{arch}-addon-mylo-siliconflow
+arch:
+  - amd64
+  - aarch64
+startup: services
+init: false
+hassio_api: true
+homeassistant_api: true
+hassio_role: manager
+
+ingress: true
+panel_icon: mdi:brain
+panel_title: Mylo SiliconFlow
+
+map:
+  - homeassistant_config:rw
+  - share:rw
+
+options:
+  api_key: ""
+  llm_provider: siliconflow
+  model: deepseek-ai/DeepSeek-V4-Flash
+  reconciliation_model: deepseek-ai/DeepSeek-V4-Flash
+  sync_frequency: nightly
+  memory_token_limit: 8000
+  proactive_notifications: true
+  siliconflow_url: https://api.siliconflow.cn/v1
+  ollama_url: ""
+  session_budget_usd: 0.50
+  monthly_budget_usd: 15.00
+  context_budget_factor: 0.6
+  context_output_reserve_tokens: 8000
+  working_set_max_entities: 40
+  log_level: INFO
+
+schema:
+  api_key: "password?"
+  llm_provider: list(anthropic|openai|gemini|ollama|siliconflow)
+  model: str
+  reconciliation_model: str
+  siliconflow_url: url
+  ollama_url: "str?"
+  sync_frequency: list(nightly|weekly|manual)
+  memory_token_limit: int(1000,64000)
+  proactive_notifications: bool
+  # Deprecated — ignored since 1.5.0b4; kept optional for one release so
+  # stored options from older versions still validate on update.
+  max_daily_notifications: "int(0,20)?"
+  quiet_hours_start: "match(^([01]\\d|2[0-3]):[0-5]\\d$)?"
+  quiet_hours_end: "match(^([01]\\d|2[0-3]):[0-5]\\d$)?"
+  notification_method: "list(auto|mobile|persistent|off)?"
+  session_budget_usd: "float(0,100)?"
+  monthly_budget_usd: "float(0,1000)?"
+  context_budget_factor: "float(0.1,0.95)?"
+  context_output_reserve_tokens: "int(1000,64000)?"
+  working_set_max_entities: "int(0,200)?"
+  log_level: list(DEBUG|INFO|WARNING|ERROR)

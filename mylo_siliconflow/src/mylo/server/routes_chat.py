@@ -1,0 +1,630 @@
+# Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Chat endpoints.
+
+``POST /api/chat`` — submit a user message, receive a server-sent-events
+stream of tool_loop events. Event types match the CLI:
+
+* ``text`` — ``{"text": "..."}``
+* ``text_delta`` — ``{"text": "..."}`` (partial assistant text; a later
+  ``text`` carries the final block and supersedes the deltas)
+* ``status`` — ``{"phase": "thinking|tool|cancelled", "tool": ..., "label": "..."}``
+* ``tool_call`` — ``{"name": "...", "input": {...}, "id": "..."}``
+* ``tool_result`` — ``{"name": "...", "status": "ok|error", "data": ...}``
+* ``done`` — ``{"stop_reason": "...", "usage": {...}}``
+
+SSE was chosen over websocket because: (a) HA Ingress proxies SSE cleanly,
+(b) a single POST→stream is sufficient for our flow — no bidirectional
+signaling needed in M5a.
+
+``POST /api/chat/cancel`` asks the running turn to stop; the loop finishes
+the current tool (never interrupts one), keeps partial text, and ends the
+turn with ``stop_reason: "cancelled"``.
+
+``POST /api/conversation/clear`` resets the conversation — trivial helper
+so the UI can offer a ``/clear`` button.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+
+from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
+
+from mylo.context.assembler import assemble_system_prompt
+from mylo.context.memory_injection import render_current_time
+from mylo.llm.cost import cache_hit_ratio, estimate_usd
+from mylo.llm.tool_loop import (
+    DoneEvent,
+    LoopEvent,
+    StatusEvent,
+    TextDeltaEvent,
+    TextEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    run_turn,
+)
+from mylo.logging_setup import get_logger
+from mylo.safety.approval import WILDCARD
+
+log = get_logger(__name__)
+
+
+# Seconds between SSE keepalive comments while a turn runs. The model
+# call is non-streaming, so a long plan produces a minute or more of
+# silence; HA ingress and some browsers drop an idle stream well before
+# that. A comment line is invisible to the client parser (it skips
+# lines starting with ':') but keeps the connection alive.
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+async def _heartbeat(response: Any, interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
+    """Write an SSE comment every ``interval`` seconds until cancelled or
+    the transport closes. Runs as a background task beside the turn."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await response.write(b": ping\n\n")
+            except (ConnectionResetError, ClientConnectionResetError):
+                return
+    except asyncio.CancelledError:
+        return
+
+
+async def _safe_emit(response: Any, name: str, data: dict[str, Any]) -> None:
+    """Write one SSE event, swallowing a closed-transport write.
+
+    When the user navigates away mid-turn the client is gone; a failed write
+    ends the turn quietly instead of cascading tracebacks through the error
+    handler and ``write_eof``.
+    """
+    payload = f"event: {name}\ndata: {json.dumps(data, default=str)}\n\n"
+    try:
+        await response.write(payload.encode("utf-8"))
+    except (ConnectionResetError, ClientConnectionResetError):
+        return
+
+
+def _approved_plan_ids_from_body(body: dict[str, Any]) -> frozenset[str]:
+    """Extract the plan ids the user approved (clicked Apply on) this turn.
+
+    Tolerant of garbage: a missing/non-list field yields no approvals, and
+    non-string or empty-string entries within the list are dropped rather
+    than raising — a malformed request should degrade to "nothing approved"
+    instead of a 500. The ``"*"`` wildcard is only valid in-process (tests,
+    internal callers) — a request arriving over HTTP can never carry it.
+    """
+    raw = body.get("approved_plan_ids")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(p for p in raw if isinstance(p, str) and p and p != WILDCARD)
+
+
+def _sse_for(event: LoopEvent) -> tuple[str, dict[str, Any]] | None:
+    """Map a loop event to its SSE (name, payload). ``DoneEvent`` is
+    handled inline by the chat handler because it needs cost context."""
+    if isinstance(event, TextDeltaEvent):
+        return "text_delta", {"text": event.text}
+    if isinstance(event, StatusEvent):
+        return "status", {"phase": event.phase, "tool": event.tool, "label": event.label}
+    if isinstance(event, TextEvent):
+        return "text", {"text": event.text}
+    if isinstance(event, ToolCallEvent):
+        return "tool_call", {"id": event.id, "name": event.name, "input": event.input}
+    if isinstance(event, ToolResultEvent):
+        return "tool_result", {
+            "id": event.id,
+            "name": event.name,
+            "status": event.status,
+            "error_code": event.error_code,
+            "data": event.data,
+        }
+    return None
+
+
+async def _handle_cancel(request: web.Request) -> web.Response:
+    """Ask the running turn to stop. Idempotent; a no-op when idle."""
+    from mylo.server.app import AppKeys
+
+    conv = request.app[AppKeys.CONVERSATION]
+    if not conv.turn_active:
+        return web.json_response({"ok": True, "cancelling": False})
+    conv.cancel_requested.set()
+    log.info("chat.cancel_requested")
+    return web.json_response({"ok": True, "cancelling": True})
+
+
+def register_chat_routes(app: web.Application) -> None:
+    app.router.add_post("/api/chat", _handle_chat)
+    app.router.add_post("/api/chat/cancel", _handle_cancel)
+    app.router.add_post("/api/conversation/clear", _handle_clear)
+    app.router.add_post("/api/conversation/new", _handle_new_conversation)
+    app.router.add_get("/api/conversation", _handle_get_conversation)
+    app.router.add_get("/api/catchup", _handle_catchup)
+    app.router.add_get("/api/health", _handle_health)
+    app.router.add_get("/api/status", _handle_status)
+    app.router.add_get("/api/activity", _handle_activity)
+    app.router.add_post("/api/verifications/{id}/ack", _handle_ack_verification)
+
+
+async def _handle_ack_verification(request: web.Request) -> web.Response:
+    """Hide one verification card. Idempotent; unknown id → ok False."""
+    from mylo.server.app import AppKeys
+
+    vlog = request.app.get(AppKeys.VERIFICATIONS)
+    if vlog is None:
+        return web.json_response({"ok": False})
+    return web.json_response({"ok": vlog.acknowledge(request.match_info["id"])})
+
+
+async def _handle_health(_request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def _handle_catchup(request: web.Request) -> web.Response:
+    """Lightweight status summary for the catch-up banner.
+
+    Returns what happened since the user's last interaction: memory
+    sync results, background monitor findings, automation errors.
+    Built from data we already have — no LLM call, no token cost.
+
+    The UI shows this as a divider banner when the gap since the last
+    message exceeds a threshold (default 2h).
+    """
+    from datetime import UTC, datetime
+
+    from mylo.server.app import AppKeys
+
+    conv = request.app[AppKeys.CONVERSATION]
+
+    # Find the timestamp of the last message.
+    last_ts: str | None = None
+    if conv.history:
+        for msg in reversed(conv.history):
+            ts = msg.get("created_at")
+            if isinstance(ts, str):
+                last_ts = ts
+                break
+
+    if last_ts is None:
+        # No conversation history — no gap to report.
+        return web.json_response({"show_banner": False})
+
+    try:
+        last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return web.json_response({"show_banner": False})
+
+    now = datetime.now(UTC)
+    gap_seconds = (now - last_dt).total_seconds()
+    gap_hours = gap_seconds / 3600
+
+    # Only show banner for gaps > 2 hours.
+    if gap_hours < 2:
+        return web.json_response({"show_banner": False, "gap_hours": round(gap_hours, 1)})
+
+    # Build summary from existing data sources.
+    lines: list[str] = []
+
+    # Memory changes since last interaction.
+    memory_store = request.app.get(AppKeys.MEMORY)
+    if memory_store is not None:
+        mem = memory_store.current()
+        if mem.last_sync and mem.last_sync > last_ts:
+            lines.append("Memory sync ran — context updated")
+
+    # Recent audit activity since last message.
+    if AppKeys.TOOL_CONTEXT in request.app:
+        audit = request.app[AppKeys.TOOL_CONTEXT].audit
+        recent = audit.read_recent(limit=50)
+        since_last = [e for e in recent if e.get("timestamp", "") > last_ts]
+        if since_last:
+            successes = sum(1 for e in since_last if e.get("result") == "success")
+            failures = sum(1 for e in since_last if e.get("result") == "failure")
+            if successes:
+                lines.append(f"{successes} background action(s) completed")
+            if failures:
+                lines.append(f"{failures} action(s) failed — check Activity tab")
+
+    # Pending actions from the proactive suggestion engine.
+    pending_actions: list[dict[str, Any]] = []
+    if memory_store is not None:
+        mem = memory_store.current()
+        unresolved = [pa for pa in mem.pending_actions if not pa.resolved]
+        unresolved.sort(key=lambda pa: pa.confidence, reverse=True)
+        for pa in unresolved:
+            lines.append(pa.message)
+            pending_actions.append(
+                {
+                    "id": pa.id,
+                    "type": pa.type,
+                    "entity_id": pa.entity_id,
+                    "title": pa.title,
+                    "message": pa.message,
+                    "detected_at": pa.detected_at,
+                }
+            )
+
+    if not lines:
+        lines.append("No new activity while you were away")
+
+    # Format the gap duration.
+    if gap_hours < 24:
+        gap_label = f"{int(gap_hours)} hours"
+    else:
+        days = int(gap_hours / 24)
+        gap_label = f"{days} day{'s' if days != 1 else ''}"
+
+    return web.json_response(
+        {
+            "show_banner": True,
+            "gap_label": f"{gap_label} since last message",
+            "lines": lines,
+            "pending_actions": pending_actions,
+        }
+    )
+
+
+async def _handle_activity(request: web.Request) -> web.Response:
+    """Paginated audit log for the Activity tab.
+
+    Query params:
+    - ``limit`` (int, default 100): max entries to return.
+    - ``tool`` (str): filter to a specific tool name.
+    - ``result`` (str): filter to a result kind (success/failure/rolled_back/denied).
+    - ``tier`` (int): filter to a tier level.
+    """
+    from mylo.server.app import AppKeys
+
+    audit = AppKeys.TOOL_CONTEXT in request.app and request.app[AppKeys.TOOL_CONTEXT].audit
+
+    if not audit:
+        return web.json_response({"entries": [], "total": 0})
+
+    limit = int(request.query.get("limit", "200"))
+    tool_filter = request.query.get("tool")
+    result_filter = request.query.get("result")
+    tier_filter = request.query.get("tier")
+
+    entries = request.app[AppKeys.TOOL_CONTEXT].audit.read_recent(limit=limit)
+
+    if tool_filter:
+        entries = [e for e in entries if e.get("tool_name") == tool_filter]
+    if result_filter:
+        entries = [e for e in entries if e.get("result") == result_filter]
+    if tier_filter:
+        try:
+            tier_val = int(tier_filter)
+            entries = [e for e in entries if e.get("tier") == tier_val]
+        except ValueError:
+            pass
+
+    return web.json_response({"entries": entries, "total": len(entries)})
+
+
+async def _handle_status(request: web.Request) -> web.Response:
+    """Header status-bar payload — entity/automation counts, memory
+    sync freshness, version.
+
+    The panel header polls this on mount so we avoid stuffing all of
+    this into the SSE stream. Cheap: every field is already cached in
+    memory (registries + MemoryStore.current()).
+    """
+    from mylo.server.app import AppKeys
+
+    registries = request.app.get(AppKeys.REGISTRIES)
+    memory_store = request.app.get(AppKeys.MEMORY)
+    config = request.app[AppKeys.CONFIG]
+    vlog = request.app.get(AppKeys.VERIFICATIONS)
+
+    entity_count = 0
+    automation_count = 0
+    if registries is not None:
+        entity_count = sum(
+            1 for e in registries.entities.values() if not e.disabled_by and not e.hidden_by
+        )
+        automation_count = sum(
+            1
+            for e in registries.entities.values()
+            if e.domain == "automation" and not e.disabled_by and not e.hidden_by
+        )
+
+    memory_payload: dict[str, Any] = {
+        "last_sync": None,
+        "pending_conflicts": 0,
+        "findings": 0,
+        "last_sync_error": None,
+        "last_sync_attempt": None,
+    }
+    if memory_store is not None:
+        mem = memory_store.current()
+        memory_payload = {
+            "last_sync": mem.last_sync,
+            "pending_conflicts": len(mem.pending_conflicts()),
+            # Drives the header's findings badge via the existing poll.
+            "findings": sum(1 for pa in mem.pending_actions if not pa.resolved),
+            "last_sync_error": mem.last_sync_error,
+            "last_sync_attempt": mem.last_sync_attempt,
+        }
+
+    from mylo import __version__
+    from mylo.llm.status_labels import label_for
+    from mylo.tools import registry as tool_registry
+
+    tools = {
+        t.name: {"label": label_for(t.name), "tier": int(t.tier)} for t in tool_registry.all_tools()
+    }
+
+    conv = request.app.get(AppKeys.CONVERSATION)
+    return web.json_response(
+        {
+            "ok": True,
+            "version": __version__,
+            "entities": entity_count,
+            "automations": automation_count,
+            "memory": memory_payload,
+            "tools": tools,
+            "has_provider": AppKeys.PROVIDER in request.app,
+            # Recovery signals for a panel whose stream dropped mid-turn:
+            # keep polling while the turn is still running, then replay
+            # the last turn's usage into the session counters.
+            "turn_active": bool(conv.turn_active) if conv is not None else False,
+            "last_turn": request.app.get(AppKeys.LAST_TURN),
+            "model": config.model,
+            "provider": config.llm_provider,
+            "verifications": [v.to_dict() for v in vlog.unacknowledged()]
+            if vlog is not None
+            else [],
+        }
+    )
+
+
+async def _handle_clear(request: web.Request) -> web.Response:
+    from mylo.server.app import AppKeys
+
+    conv = request.app[AppKeys.CONVERSATION]
+    if conv.turn_active:
+        return web.json_response({"ok": False, "error": "turn_in_progress"}, status=409)
+    await conv.clear()
+    return web.json_response({"ok": True})
+
+
+async def _handle_new_conversation(request: web.Request) -> web.Response:
+    """Archive the current conversation and start fresh.
+
+    The old messages stay in SQLite under the old conversation_id.
+    A new conversation_id is generated so the LLM context starts
+    clean. The UI should clear its local items after this returns.
+    """
+    from datetime import UTC, datetime
+
+    from mylo.server.app import AppKeys
+
+    conv = request.app[AppKeys.CONVERSATION]
+    base_ctx = request.app[AppKeys.TOOL_CONTEXT]
+    if conv.turn_active:
+        return web.json_response({"ok": False, "error": "turn_in_progress"}, status=409)
+
+    old_id = conv.conversation_id
+    new_id = f"conv_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+
+    conv.conversation_id = new_id
+    conv.history = []
+    base_ctx.conversation_id = new_id
+
+    log.info("conversation.new", old_id=old_id, new_id=new_id)
+    return web.json_response({"ok": True, "old_id": old_id, "new_id": new_id})
+
+
+async def _handle_get_conversation(request: web.Request) -> web.Response:
+    """Return the current conversation history.
+
+    Used by the UI as a polling fallback: if the SSE stream dies
+    mid-turn (which happens when a tier-2 write triggers reload_all
+    and HA's ingress restarts), the UI can poll this endpoint and
+    render any turns that finished after the disconnect.
+    """
+    from mylo.server.app import AppKeys
+
+    conv = request.app[AppKeys.CONVERSATION]
+    # Read-only: a background turn may still be running (the SSE drop
+    # doesn't cancel it), and its live history must not be replaced by
+    # a limited storage window. The hydrator stitches raw rows itself.
+    rows = await conv.peek(limit=int(os.environ.get("MYLO_HISTORY_LIMIT", "12")))
+    return web.json_response({"messages": rows})
+
+
+async def _handle_chat(request: web.Request) -> web.StreamResponse:
+    from mylo.server.app import AppKeys
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return web.json_response({"error": "missing_message"}, status=400)
+
+    # The UI sets ``approved: true`` when the user clicks "Apply" after
+    # seeing a dry-run preview. That flag travels on the next request,
+    # authorizing tier-2/3 writes for this turn only. Default false.
+    approved = bool(body.get("approved", False))
+    approved_plan_ids = _approved_plan_ids_from_body(body)
+    # The UI passes the running session cost so the assembler can inject
+    # a budget warning when we're approaching the configured cap.
+    session_cost = float(body.get("session_cost_usd", 0.0))
+
+    provider = request.app.get(AppKeys.PROVIDER)
+    if provider is None:
+        return web.json_response(
+            {"error": "no_api_key", "message": "ANTHROPIC_API_KEY is not set"},
+            status=503,
+        )
+
+    conv = request.app[AppKeys.CONVERSATION]
+    # One turn at a time. A second concurrent turn interleaves its
+    # appends with the running one's on the shared history — turn B's
+    # messages land between turn A's assistant(tool_use) and its
+    # user(tool_result) — and Anthropic then rejects EVERY subsequent
+    # request ("tool_result must have a corresponding tool_use in the
+    # previous message"). Happens in practice when the SSE stream drops
+    # mid-turn (the server keeps running the turn) and the UI's queued
+    # Apply or a fresh submit fires while it's still going.
+    if conv.turn_active:
+        return web.json_response(
+            {
+                "error": "turn_in_progress",
+                "message": "Mylo is still finishing the previous request — try again shortly",
+            },
+            status=409,
+        )
+    base_ctx = request.app[AppKeys.TOOL_CONTEXT]
+    # Per-turn context — user_approved is request-scoped, not server-wide.
+    from mylo.tools.context import ToolContext
+
+    ctx = ToolContext(
+        ws_client=base_ctx.ws_client,
+        registries=base_ctx.registries,
+        config=base_ctx.config,
+        permissions=base_ctx.permissions,
+        audit=base_ctx.audit,
+        states=base_ctx.states,
+        conversation_id=base_ctx.conversation_id,
+        user_approved=approved,
+        dry_run=False,
+        approved_plan_ids=approved_plan_ids,
+        plans=base_ctx.plans,
+        cards=base_ctx.cards,
+        verifications=base_ctx.verifications,
+    )
+    tools = request.app[AppKeys.TOOLS_JSON]
+    config = request.app[AppKeys.CONFIG]
+    is_local = config.llm_provider == "ollama"
+    # Persistent month-to-date spend drives the monthly-budget warning.
+    # (Session cost is client-side; the monthly total lives server-side.)
+    ledger = request.app[AppKeys.USAGE_LEDGER]
+    monthly_spent = ledger.month_spent()
+
+    # Full four-layer system prompt. The assembler reads live registries
+    # + memory + the latest user turn and picks which memory sections /
+    # task references to include. Scratchpad is re-read each turn so
+    # notes the user just recorded are available immediately.
+    memory_store = request.app[AppKeys.MEMORY]
+    vlog = request.app.get(AppKeys.VERIFICATIONS)
+    assembled = assemble_system_prompt(
+        registries=request.app.get(AppKeys.REGISTRIES),
+        memory=memory_store.current(),
+        conversation_text=message,
+        mylo_data_dir=config.mylo_data_dir,
+        timezone=request.app.get(AppKeys.HA_TIMEZONE),
+        verifications=vlog.for_prompt() if vlog is not None else None,
+        session_cost_usd=session_cost,
+        session_budget_usd=config.session_budget_usd,
+        monthly_spent_usd=monthly_spent,
+        monthly_budget_usd=config.monthly_budget_usd,
+        is_local_provider=is_local,
+        model=config.model,
+        budget_factor=config.context_budget_factor,
+        output_reserve=config.context_output_reserve_tokens,
+        working_set_max_entities=config.working_set_max_entities,
+    )
+    system_text = assembled.system
+
+    # Prefix the user message with a compact timestamp so the model
+    # knows the current time without it being in the system prompt.
+    # This keeps the system block stable across turns, enabling
+    # Anthropic's prompt cache (~5,500 tokens saved per cache hit).
+    time_prefix = render_current_time(request.app.get(AppKeys.HA_TIMEZONE))
+    message = f"[{time_prefix}] {message}"
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # hint for proxies (nginx/ingress)
+        },
+    )
+    await response.prepare(request)
+
+    async def emit(name: str, data: dict[str, Any]) -> None:
+        await _safe_emit(response, name, data)
+
+    conv.turn_active = True
+    conv.cancel_requested.clear()
+    heartbeat = asyncio.create_task(_heartbeat(response))
+    try:
+        async for event in _turn_events(
+            message=message,
+            conversation=conv,
+            provider=provider,
+            ctx=ctx,
+            system=system_text,
+            tools=tools,
+            model=config.model,
+            prompt_version=assembled.prompt_version,
+            cancel=conv.cancel_requested,
+        ):
+            mapped = _sse_for(event)
+            if mapped is not None:
+                await emit(*mapped)
+            elif isinstance(event, DoneEvent):
+                turn_cost = estimate_usd(event.usage, config.model, is_local=is_local)
+                # Accumulate into the persistent monthly total (returns the
+                # new month-to-date so the UI can show it immediately).
+                month_to_date = ledger.record(turn_cost)
+                done_payload = {
+                    "stop_reason": event.stop_reason,
+                    "usage": event.usage,
+                    "truncated": event.truncated,
+                    "estimated_usd": round(turn_cost, 4),
+                    "cache_hit_ratio": round(cache_hit_ratio(event.usage), 3),
+                    "monthly_spent_usd": round(month_to_date, 4),
+                    "monthly_budget_usd": config.monthly_budget_usd,
+                }
+                # Kept for /api/status so a panel that lost the stream can
+                # still credit this turn's tokens and cost after recovery.
+                request.app[AppKeys.LAST_TURN] = {
+                    **done_payload,
+                    "completed_at": datetime.now(UTC).isoformat(),
+                }
+                await emit("done", done_payload)
+    except Exception as exc:
+        log.exception("chat.turn_failed")
+        await emit("error", {"message": str(exc), "type": type(exc).__name__})
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        conv.turn_active = False
+        with contextlib.suppress(ConnectionResetError, ClientConnectionResetError):
+            await response.write_eof()
+    return response
+
+
+async def _turn_events(**kwargs: Any) -> AsyncIterator[LoopEvent]:
+    async for event in run_turn(user_message=kwargs.pop("message"), **kwargs):
+        yield event

@@ -1,0 +1,407 @@
+// Copyright 2026 Maxwell Monson / Oasis Enterprise LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// SSE client for /api/chat.
+//
+// EventSource is read-only GET, but our chat endpoint is POST (message in
+// body). We use fetch + ReadableStream to receive `event:/data:` frames
+// manually. The parser handles multi-line data and ignores comments.
+
+export type ServerEvent =
+  | { type: "text"; text: string }
+  | { type: "text_delta"; text: string }
+  | { type: "status"; phase: string; tool: string | null; label: string }
+  | { type: "tool_call"; id: string; name: string; input: Record<string, unknown> }
+  | {
+      type: "tool_result";
+      id: string;
+      name: string;
+      status: "ok" | "error";
+      error_code: string | null;
+      data: unknown;
+    }
+  | {
+      type: "done";
+      stop_reason: string;
+      usage: Record<string, number>;
+    }
+  | { type: "error"; message: string; errorType: string };
+
+export interface SendOptions {
+  approved?: boolean;
+  approvedPlanIds?: string[];
+  sessionCostUsd?: number;
+  signal?: AbortSignal;
+}
+
+// Relative URLs so the UI works both at / (localhost dev) AND at
+// /api/hassio_ingress/<token>/ (the HA panel iframe). An absolute
+// "/api/..." URL under ingress would hit HA's own REST, not ours.
+function apiUrl(path: string): string {
+  return new URL(path, document.baseURI).toString();
+}
+
+export async function* streamChat(
+  message: string,
+  options: SendOptions = {},
+): AsyncGenerator<ServerEvent, void, void> {
+  const response = await fetch(apiUrl("api/chat"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      approved: Boolean(options.approved),
+      approved_plan_ids: options.approvedPlanIds ?? [],
+      session_cost_usd: options.sessionCostUsd ?? 0,
+    }),
+    signal: options.signal,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`chat endpoint returned ${response.status}: ${text}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("no response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let idx: number;
+    // SSE frames are separated by a blank line (\n\n).
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const parsed = parseFrame(frame);
+      if (parsed) yield parsed;
+    }
+  }
+}
+
+function parseFrame(frame: string): ServerEvent | null {
+  let eventName = "message";
+  const dataLines: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(dataLines.join("\n"));
+  } catch {
+    return null;
+  }
+  const obj = payload as Record<string, unknown>;
+  switch (eventName) {
+    case "text":
+      return { type: "text", text: String(obj.text ?? "") };
+    case "text_delta":
+      return { type: "text_delta", text: String(obj.text ?? "") };
+    case "status":
+      return {
+        type: "status",
+        phase: String(obj.phase ?? "thinking"),
+        tool: typeof obj.tool === "string" ? obj.tool : null,
+        label: String(obj.label ?? "Working"),
+      };
+    case "tool_call":
+      return {
+        type: "tool_call",
+        id: String(obj.id),
+        name: String(obj.name),
+        input: (obj.input as Record<string, unknown>) ?? {},
+      };
+    case "tool_result":
+      return {
+        type: "tool_result",
+        id: String(obj.id),
+        name: String(obj.name),
+        status: (obj.status as "ok" | "error") ?? "error",
+        error_code: (obj.error_code as string | null) ?? null,
+        data: obj.data,
+      };
+    case "done":
+      return {
+        type: "done",
+        stop_reason: String(obj.stop_reason ?? ""),
+        usage: (obj.usage as Record<string, number>) ?? {},
+      };
+    case "error":
+      return {
+        type: "error",
+        message: String(obj.message ?? ""),
+        errorType: String(obj.type ?? "error"),
+      };
+    default:
+      return null;
+  }
+}
+
+export async function clearConversation(): Promise<void> {
+  await fetch(apiUrl("api/conversation/clear"), { method: "POST" });
+}
+
+// Ask the server to stop the running turn. Resolves true when a turn was
+// actually running; the stream itself closes when the server emits `done`.
+export async function cancelChat(): Promise<boolean> {
+  const response = await fetch(apiUrl("api/chat/cancel"), { method: "POST" });
+  if (!response.ok) return false;
+  const body = (await response.json()) as { cancelling?: boolean };
+  return Boolean(body.cancelling);
+}
+
+export interface RawMessage {
+  role: "user" | "assistant";
+  content: string | RawContentBlock[];
+}
+
+export type RawContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "tool_result"; tool_use_id: string; content: string };
+
+export interface LastTurn {
+  usage: Record<string, number>;
+  estimated_usd: number;
+  monthly_spent_usd: number;
+  monthly_budget_usd: number;
+  completed_at: string;
+}
+
+// Outcome of a background verification (a write the model applied
+// optimistically, then checked). Only completed + unacknowledged
+// items are sent by the server — "pending" ones already resolved by
+// the time the panel would see them, but the status is kept broad to
+// match the server's enum.
+export interface VerificationData {
+  id: string;
+  tool: string;
+  target: string;
+  status: "pending" | "verified" | "failed" | "rolled_back";
+  message: string;
+  conversation_id: string;
+  requested_at: string;
+  completed_at: string | null;
+  acknowledged: boolean;
+}
+
+export interface ServerStatus {
+  ok: boolean;
+  version: string;
+  entities: number;
+  automations: number;
+  memory: {
+    last_sync: string | null;
+    pending_conflicts: number;
+    findings: number;
+    // Set when the most recent background sync attempt failed; the
+    // header shows "sync failed <when>" instead of "synced <when>".
+    last_sync_error?: string | null;
+    last_sync_attempt?: string | null;
+  };
+  has_provider: boolean;
+  // True while a chat turn is running server-side. A panel whose
+  // stream dropped polls this to know when to rehydrate.
+  turn_active?: boolean;
+  // The most recently completed turn's done payload, so recovery can
+  // credit its tokens and cost to the session counters.
+  last_turn?: LastTurn | null;
+  // Server-configured model/provider — the panel prices cost against
+  // these rather than assuming Anthropic Sonnet.
+  model: string;
+  provider: string;
+  // Unacknowledged background-verification outcomes.
+  verifications?: VerificationData[];
+  // Plain-language label + tier for each tool the server knows about,
+  // keyed by raw tool name. Optional — older servers won't send it, and
+  // toolLabel() humanizes the raw name when a tool is missing from it.
+  tools?: Record<string, { label: string; tier: number }>;
+}
+
+export async function fetchStatus(): Promise<ServerStatus> {
+  const response = await fetch(apiUrl("api/status"), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`status returned ${response.status}`);
+  }
+  return (await response.json()) as ServerStatus;
+}
+
+export async function ackVerification(id: string): Promise<boolean> {
+  const r = await fetch(apiUrl(`api/verifications/${encodeURIComponent(id)}/ack`), {
+    method: "POST",
+  });
+  if (!r.ok) return false;
+  return Boolean(((await r.json()) as { ok?: boolean }).ok);
+}
+
+export interface PendingActionData {
+  id: string;
+  type: string;
+  entity_id: string;
+  title: string;
+  message: string;
+  detected_at: string;
+  last_seen?: string;
+}
+
+// Active monitor findings — the always-available surface behind the
+// header badge (the catch-up banner only renders after a 2h absence).
+export async function fetchFindings(): Promise<PendingActionData[]> {
+  const response = await fetch(apiUrl("api/findings"), { method: "GET" });
+  if (!response.ok) return [];
+  const body = (await response.json()) as { findings?: PendingActionData[] };
+  return body.findings ?? [];
+}
+
+export interface CatchupData {
+  show_banner: boolean;
+  gap_label?: string;
+  lines?: string[];
+  pending_actions?: PendingActionData[];
+}
+
+export async function fetchCatchup(): Promise<CatchupData> {
+  const response = await fetch(apiUrl("api/catchup"), { method: "GET" });
+  if (!response.ok) return { show_banner: false };
+  return (await response.json()) as CatchupData;
+}
+
+export async function clearPendingActions(): Promise<void> {
+  await fetch(apiUrl("api/pending-actions/clear"), { method: "POST" });
+}
+
+export async function dismissPendingAction(id: string): Promise<void> {
+  await fetch(apiUrl("api/pending-actions/dismiss"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+}
+
+export async function newConversation(): Promise<void> {
+  await fetch(apiUrl("api/conversation/new"), { method: "POST" });
+}
+
+export async function fetchConversation(): Promise<RawMessage[]> {
+  const response = await fetch(apiUrl("api/conversation"), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`conversation endpoint returned ${response.status}`);
+  }
+  const body = (await response.json()) as { messages: RawMessage[] };
+  return body.messages || [];
+}
+
+// ─── Memory API ───────────────────────────────────────────────────────────
+
+import type { AuditEntry, MemoryFull, ScratchpadEntry, SyncResult } from "./types";
+
+export async function fetchMemoryFull(): Promise<MemoryFull> {
+  const response = await fetch(apiUrl("api/memory/full"), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`memory/full returned ${response.status}`);
+  }
+  return (await response.json()) as MemoryFull;
+}
+
+export async function fetchScratchpad(): Promise<ScratchpadEntry[]> {
+  const response = await fetch(apiUrl("api/memory/scratchpad"), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`memory/scratchpad returned ${response.status}`);
+  }
+  const body = (await response.json()) as { entries: ScratchpadEntry[] };
+  return body.entries || [];
+}
+
+export async function syncMemory(options: { applyPrune?: boolean } = {}): Promise<SyncResult> {
+  const response = await fetch(apiUrl("api/memory/sync"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apply_prune: Boolean(options.applyPrune) }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`memory/sync ${response.status}: ${text}`);
+  }
+  return (await response.json()) as SyncResult;
+}
+
+export async function applyPrune(options: { ids?: string[] } = {}): Promise<SyncResult> {
+  const body: Record<string, unknown> = {};
+  if (options.ids) body.ids = options.ids;
+  const response = await fetch(apiUrl("api/memory/prune"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`memory/prune ${response.status}`);
+  }
+  return (await response.json()) as SyncResult;
+}
+
+export async function deleteMemoryItem(section: string, id: string): Promise<void> {
+  const response = await fetch(apiUrl("api/memory/item"), {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ section, id }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`memory/item DELETE ${response.status}: ${text}`);
+  }
+}
+
+export async function fetchActivity(options: {
+  limit?: number;
+  tool?: string;
+  result?: string;
+} = {}): Promise<AuditEntry[]> {
+  const params = new URLSearchParams();
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.tool) params.set("tool", options.tool);
+  if (options.result) params.set("result", options.result);
+  const qs = params.toString();
+  const response = await fetch(apiUrl(`api/activity${qs ? `?${qs}` : ""}`), {
+    method: "GET",
+  });
+  if (!response.ok) {
+    throw new Error(`activity returned ${response.status}`);
+  }
+  const body = (await response.json()) as { entries: AuditEntry[] };
+  return body.entries || [];
+}
+
+export async function resolveConflict(
+  conflictId: string,
+  choice: "a" | "b" | "dismiss",
+): Promise<void> {
+  const response = await fetch(
+    apiUrl(`api/memory/conflict/${encodeURIComponent(conflictId)}/resolve`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ choice }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`conflict resolve returned ${response.status}`);
+  }
+}
